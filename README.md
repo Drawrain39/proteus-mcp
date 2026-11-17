@@ -1,2 +1,7 @@
 # proteus-mcp
+
 使AI Agent/Harness 能够直接操控Proteus，提升AI对于proteus的工作效率
+
+基于proteus8的MCP服务，暂时先不做proteus9相关（其实是因为学校数电实验的proteus就是proteus8的）
+
+做这个的初衷是因为数电实验，曾试过让Agent一边识图一遍操控电脑的效率非常慢，还要各种反复确认，非常的费token费时间，所以我想搞个mcp出来，也许能够加快Agent的工作效率，更快的帮忙完成设计与调试，目前还在开发中
