@@ -15,6 +15,7 @@ from uuid import uuid4
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.shared.exceptions import McpError
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .config import Settings
 from .doctor import discover_proteus
@@ -29,6 +30,47 @@ WINDOWS_STATUS = "ControlStatus"  # Always surfaced by Windows-MCP 0.8.9.
 SHORTCUTS = {"escape", "enter", "tab", "shift+tab", "ctrl+a", "ctrl+n", "ctrl+o", "ctrl+s",
              "ctrl+shift+s", "ctrl+z", "ctrl+y", "p", "r", "l", "m", "e", "space", "f8",
              "up", "down", "left", "right", "home", "end"}
+MAX_BATCH_CLICKS = 16
+
+
+class CanvasPoint(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    x: float = Field(ge=0, lt=1)
+    y: float = Field(ge=0, lt=1)
+
+
+class ViewRegion(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    left: float = Field(ge=0, lt=1)
+    top: float = Field(ge=0, lt=1)
+    right: float = Field(gt=0, le=1)
+    bottom: float = Field(gt=0, le=1)
+
+    @model_validator(mode="after")
+    def check_bounds(self):
+        if self.left >= self.right or self.top >= self.bottom:
+            raise ValueError("Area must have positive width and height")
+        return self
+
+    def pixels(self, rect: list[int]) -> list[int]:
+        left, top, right, bottom = rect
+        width, height = right - left, bottom - top
+        region = [left + int(self.left * width), top + int(self.top * height),
+                  left + int(self.right * width), top + int(self.bottom * height)]
+        if region[2] <= region[0] or region[3] <= region[1]:
+            raise ValueError("Area rounds to an empty pixel rectangle")
+        return region
+
+
+def point_pixels(rect: list[int], x: float, y: float) -> list[int]:
+    left, top, right, bottom = rect
+    return [left + int(x * (right - left)), top + int(y * (bottom - top))]
+
+
+def ms(seconds: float) -> float:
+    return round(seconds * 1000, 2)
 
 
 class WindowsMcpBackend:
@@ -39,6 +81,7 @@ class WindowsMcpBackend:
         self.tools: dict = {}
         self.queue: asyncio.Queue[tuple[Callable[[], Awaitable], asyncio.Future] | None] = asyncio.Queue()
         self.worker: asyncio.Task | None = None
+        self.active_request: asyncio.Future | None = None
         self.observations: dict = {}
         self.store: EvidenceStore | None = None
         self.project_destination: Path | None = None
@@ -58,6 +101,7 @@ class WindowsMcpBackend:
                 operation, future = request
                 if future.cancelled():
                     continue
+                self.active_request = future
                 try:
                     result = await operation()
                 except Exception as exc:  # noqa: BLE001 - forward the original tool error to its caller
@@ -66,6 +110,8 @@ class WindowsMcpBackend:
                 else:
                     if not future.done():
                         future.set_result(result)
+                finally:
+                    self.active_request = None
                 if future.cancelled():
                     await self._release()
         finally:
@@ -193,7 +239,10 @@ class WindowsMcpBackend:
             raise ValueError("Backend not connected")
         result = await self.session.call_tool(name, args)
         messages = [item.text for item in result.content if item.type == "text"]
-        if result.isError or any(text.lstrip().lower().startswith(("error", "failed")) for text in messages):
+        blocked_click = name == "Click" and any("so the click went nowhere" in text for text in messages)
+        if result.isError or blocked_click or any(
+            text.lstrip().lower().startswith(("error", "failed")) for text in messages
+        ):
             raise ValueError("Windows-MCP failed: " + "\n".join(messages)[:1500])
         return result
 
@@ -208,57 +257,125 @@ class WindowsMcpBackend:
             self.store = EvidenceStore(self.settings.workspace / "artifacts/gui")
         return self.store
 
-    async def _observe(self):
+    async def _observe(
+        self, area: ViewRegion | None = None, *, previous: dict | None = None,
+        same_target: bool = False, input_ms: float | None = None,
+    ):
         self.observations.clear()
         exe = self._proteus_exe()
         target = unique_target(exe, require_foreground=True)
+        if previous is not None:
+            if target == previous["target"]:
+                area = previous.get("area")
+            elif same_target:
+                raise ValueError("Window/focus/bounds changed during batch; observe again")
+        frame = area.pixels(target["rect"]) if area else target["rect"]
         store = self._store()
         shot = store.path / f"screen-{uuid4().hex}.png"
-        result = await self._call("Screenshot", {"region": target["rect"]})
+        started = time.perf_counter()
+        result = await self._call("Screenshot", {"region": frame})
+        capture_ms = ms(time.perf_counter() - started)
         images = [item for item in result.content if item.type == "image" and item.mimeType == "image/png"]
         if len(images) != 1:
             raise ValueError("Screenshot did not return exactly one PNG")
         if unique_target(exe, require_foreground=True) != target:
             raise ValueError("Target changed during capture; observe again")
+        image_bytes = base64.b64decode(images[0].data, validate=True)
         with shot.open("xb") as stream:
-            stream.write(base64.b64decode(images[0].data, validate=True))
+            stream.write(image_bytes)
         if self.project_destination:
             self.run_screenshots.add(shot.name)
         token = uuid4().hex
-        self.observations[token] = {"target": target, "time": time.monotonic()}
+        self.observations[token] = {"target": target, "time": time.monotonic(), "frame": frame, "area": area}
+        timing = {"capture_ms": capture_ms}
+        if input_ms is not None:
+            timing["input_ms"] = input_ms
         metadata = {"status": "PASS", "observation_id": token, "expires_seconds": 30,
                     "target": target, "screenshot": str(shot),
-                    "note": "Inspect the returned image; token permits exactly one input."}
+                    "frame_rect": frame, "image_bytes": len(image_bytes), "timing": timing,
+                    "note": "Coordinates are relative to this image. The observation token is single-use."}
         store.event("observe", **metadata)
         return metadata, images
 
-    async def observe(self):
+    async def observe(self, area: ViewRegion | None = None):
         async def read():
             self._proteus_exe()
             await self._connect()
-            return await self._observe()
+            return await self._observe(area)
         return await self._request(read)
+
+    def _take_observation(self, observation_id: str):
+        if not self.settings.gui_enabled:
+            raise ValueError("GUI input is disabled in config.local.json")
+        exe = self._proteus_exe()
+        snapshot = self.observations.pop(observation_id, None)
+        if not snapshot or time.monotonic() - snapshot["time"] > 30:
+            raise ValueError("Missing, consumed or stale observation; observe again")
+        return exe, snapshot
+
+    def _check_target(
+        self, exe: Path, snapshot: dict, loc: list[int] | None = None, *, allow_menu: bool = True,
+    ) -> None:
+        target = unique_target(exe, require_foreground=True)
+        if target != snapshot["target"]:
+            raise ValueError("Window/focus/bounds changed; observe again")
+        if loc is not None:
+            assert_target_point(target, *loc, allow_menu=allow_menu)
+
+    async def canvas_batch(self, observation_id: str, points: list[CanvasPoint]):
+        async def send():
+            if not 2 <= len(points) <= MAX_BATCH_CLICKS:
+                raise ValueError(f"Provide 2 to {MAX_BATCH_CLICKS} canvas points")
+            exe, snapshot = self._take_observation(observation_id)
+            if snapshot.get("area") is None or snapshot["frame"] == snapshot["target"]["rect"]:
+                raise ValueError("Observe the cropped schematic canvas before batching")
+            title = snapshot["target"]["title"].casefold()
+            if not title.endswith(("schematic capture", "原理图绘制")):
+                raise ValueError("Batch clicks require the Proteus schematic canvas")
+            locs = [point_pixels(snapshot["frame"], point.x, point.y) for point in points]
+            store = self._store()
+            attempted = completed = 0
+            input_seconds = 0.0
+            batch_id = uuid4().hex
+            try:
+                for loc in locs:
+                    if self.active_request is not None and self.active_request.cancelled():
+                        raise ValueError("Batch request cancelled")
+                    self._check_target(exe, snapshot, loc, allow_menu=False)
+                    args = {"loc": loc, "button": "left", "clicks": 1}
+                    store.event("input_attempt", observation_id=observation_id, tool="Click", arguments=args,
+                                batch_id=batch_id, step=attempted + 1)
+                    attempted += 1
+                    started = time.perf_counter()
+                    await self._call("Click", args)
+                    input_seconds += time.perf_counter() - started
+                    completed += 1
+                metadata, images = await self._observe(previous=snapshot, same_target=True, input_ms=ms(input_seconds))
+            except (ExceptionGroup, McpError, OSError, ValueError, TimeoutError) as exc:
+                self.observations.clear()
+                result = {"status": "STOPPED", "batch_id": batch_id,
+                          "attempted_clicks": attempted, "acknowledged_clicks": completed,
+                          "reason": str(exc),
+                          "note": "Observe again and verify the canvas before continuing. Do not replay blindly."}
+                store.event("batch_stopped", **result)
+                return result, []
+            batch = {"batch_id": batch_id, "attempted_clicks": attempted, "acknowledged_clicks": completed}
+            store.event("batch_completed", **batch, timing=metadata.get("timing", {}))
+            return {**metadata, **batch}, images
+        return await self._request(send)
 
     async def action(self, observation_id: str, action: str, *, x: float | None = None,
                      y: float | None = None, text: str | None = None, key: str | None = None,
                      button: str = "left", double: bool = False, clear: bool = False):
         async def send():
-            if not self.settings.gui_enabled:
-                raise ValueError("GUI input is disabled in config.local.json")
-            exe = self._proteus_exe()
-            snapshot = self.observations.pop(observation_id, None)
-            if not snapshot or time.monotonic() - snapshot["time"] > 30:
-                raise ValueError("Missing, consumed or stale observation; observe again")
-            target = unique_target(exe, require_foreground=True)
-            if target != snapshot["target"]:
-                raise ValueError("Window/focus/bounds changed; observe again")
+            exe, snapshot = self._take_observation(observation_id)
+            loc = None
             if action in {"click", "type", "hover"}:
                 if (x is None or y is None or isinstance(x, bool) or isinstance(y, bool)
                         or not 0 <= x < 1 or not 0 <= y < 1):
                     raise ValueError("x/y must be normalized target-window coordinates in [0, 1)")
-                left, top, right, bottom = target["rect"]
-                loc = [left + int(x * (right - left)), top + int(y * (bottom - top))]
-                assert_target_point(target, *loc)
+                loc = point_pixels(snapshot.get("frame", snapshot["target"]["rect"]), x, y)
+            self._check_target(exe, snapshot, loc)
             if action == "hover":
                 name, args = "Click", {"loc": loc, "button": "left", "clicks": 0}
             elif action == "click":
@@ -278,8 +395,9 @@ class WindowsMcpBackend:
             self._store().event("input_attempt", observation_id=observation_id, tool=name, arguments=args)
             # No blind retries: a failed call can already have caused an input.
             try:
+                started = time.perf_counter()
                 await self._call(name, args)
-                return await self._observe()
+                return await self._observe(previous=snapshot, input_ms=ms(time.perf_counter() - started))
             except BaseException as exc:
                 self.observations.clear()
                 self._store().event("input_stopped", error=str(exc))

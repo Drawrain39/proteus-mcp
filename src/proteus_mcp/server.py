@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 from contextlib import asynccontextmanager
+from typing import Annotated
 
 from anyio import CancelScope
 from mcp.server.fastmcp import FastMCP
 from mcp.types import TextContent
+from pydantic import Field
 
-from .backend import WindowsMcpBackend
+from .backend import MAX_BATCH_CLICKS, CanvasPoint, ViewRegion, WindowsMcpBackend
 from .config import Settings
 from .doctor import doctor
 from .planner import plan_circuit
@@ -28,8 +30,10 @@ def make_server(settings: Settings) -> FastMCP:
 
     mcp = FastMCP("proteus-mcp", lifespan=lifespan, instructions=(
         "Use circuit_validate then circuit_plan. Mock PASS is not real Proteus success. "
-        "GUI inputs require inspecting a fresh target-window screenshot. After each input inspect the "
-        "returned screenshot/tree. Save new projects only under the configured workspace; never overwrite "
+        "Inspect fresh screenshots before locating GUI input. For confirmed points on one stable schematic "
+        "canvas, use proteus_canvas_batch and inspect the returned image before continuing. Use single actions "
+        "for dialogs, menus, zoom and uncertain points. Save new projects only in the configured workspace. "
+        "Never overwrite "
         "existing user projects. A real run must independently verify pins, wires, properties, save/reopen "
         "and observable simulation behavior. Do not treat the play button as functional evidence."))
 
@@ -70,9 +74,27 @@ def make_server(settings: Settings) -> FastMCP:
         return await windows.capabilities()
 
     @mcp.tool()
-    async def proteus_observe() -> list:
-        """Capture foreground Proteus. Returns an image and a single-use 30-second input token."""
-        metadata, content = await windows.observe()
+    async def proteus_observe(area: ViewRegion | None = None) -> list:
+        """Capture foreground Proteus. Optionally crop with window-relative bounds from 0 to 1.
+
+        Returned action coordinates are relative to the returned image, including after a crop.
+        An observation token is single-use and expires after 30 seconds.
+        """
+        metadata, content = await windows.observe(area)
+        return [TextContent(type="text", text=json.dumps(metadata, ensure_ascii=False)), *content]
+
+    @mcp.tool()
+    async def proteus_canvas_batch(
+        observation_id: str, points: Annotated[list[CanvasPoint], Field(min_length=2, max_length=MAX_BATCH_CLICKS)],
+    ) -> list:
+        """Left-click confirmed points on the same schematic canvas and capture only the final frame.
+
+        First observe a crop containing only the relevant canvas. Supply normalized points relative to
+        that crop, in order, for known wire endpoints/bends, placements or simulation switches.
+        Do not batch actions that can move the canvas or open a dialog. Inspect the result before continuing.
+        STOPPED gives partial counts and requires a new observation; do not replay the entire batch.
+        """
+        metadata, content = await windows.canvas_batch(observation_id, points)
         return [TextContent(type="text", text=json.dumps(metadata, ensure_ascii=False)), *content]
 
     @mcp.tool()

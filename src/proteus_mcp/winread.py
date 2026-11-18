@@ -87,7 +87,7 @@ def _enumerate_proteus(user, executable: Path | None) -> list[dict]:
     return results
 
 
-def assert_target_point(target: dict, x: int, y: int) -> None:
+def assert_target_point(target: dict, x: int, y: int, *, allow_menu: bool = True) -> None:
     from ctypes import wintypes
 
     with physical_desktop() as user:
@@ -98,7 +98,7 @@ def assert_target_point(target: dict, x: int, y: int) -> None:
         hwnd = user.WindowFromPoint(wintypes.POINT(x, y))
         if hwnd and user.GetAncestor(hwnd, 2) == target["hwnd"]:  # GA_ROOT
             return
-        if hwnd:
+        if hwnd and allow_menu:
             # Native popup menus are top-level windows, but share their owner's GUI thread.
             user.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
             user.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]

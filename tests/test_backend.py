@@ -3,9 +3,10 @@ import time
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+from mcp.types import CallToolResult, ImageContent
 
 from proteus_mcp import backend as backend_module
-from proteus_mcp.backend import WindowsMcpBackend
+from proteus_mcp.backend import CanvasPoint, ViewRegion, WindowsMcpBackend
 from proteus_mcp.config import Settings
 
 
@@ -30,7 +31,7 @@ def test_type_targets_normalized_field_and_consumes_token(gui):
             assert result[0]["observation_id"] == "next"
             gui._call.assert_awaited_once_with("Type", {"loc": [50, 350], "text": "1k", "clear": True})
             backend_module.assert_target_point.assert_called_once_with(
-                {"hwnd": 10, "rect": [-200, 50, 800, 550]}, 50, 350)
+                {"hwnd": 10, "rect": [-200, 50, 800, 550]}, 50, 350, allow_menu=True)
             with pytest.raises(ValueError, match="consumed"):
                 await gui.action("fresh", "key", key="ctrl+s")
         finally:
@@ -83,5 +84,102 @@ def test_input_failure_is_not_retried(gui):
             assert not gui.observations
         finally:
             await gui.close()
+
+    asyncio.run(run())
+
+
+def batch_points(gui):
+    target = backend_module.unique_target.return_value
+    target["title"] = "mod24 - Proteus 8 Professional - 原理图绘制"
+    region = ViewRegion(left=0.1, top=0.2, right=0.5, bottom=0.8)
+    gui.observations["fresh"].update(target=target.copy(), area=region, frame=region.pixels(target["rect"]))
+    return [CanvasPoint(x=0.25, y=0.5), CanvasPoint(x=0.75, y=0.5), CanvasPoint(x=0.5, y=0.5)]
+
+
+def test_canvas_batch_uses_crop_coordinates_and_takes_one_final_screenshot(gui):
+    points = batch_points(gui)
+
+    async def run():
+        try:
+            metadata, _ = await gui.canvas_batch("fresh", points)
+            assert metadata["acknowledged_clicks"] == 3
+            assert [c.args[1]["loc"] for c in gui._call.await_args_list] == [[0, 300], [200, 300], [100, 300]]
+            assert gui._observe.await_count == 1
+            assert gui._observe.await_args.kwargs["same_target"]
+            with pytest.raises(ValueError, match="consumed"):
+                await gui.canvas_batch("fresh", points)
+        finally:
+            await gui.close()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("failure", ["focus", "input"])
+def test_batch_stops_without_retry_when_partially_executed(gui, failure):
+    points = batch_points(gui)
+    if failure == "focus":
+        backend_module.unique_target.side_effect = [
+            backend_module.unique_target.return_value, {"hwnd": 20, "rect": [0, 0, 400, 400]}]
+    else:
+        gui._call.side_effect = [None, TimeoutError("Uncertain click")]
+
+    async def run():
+        try:
+            metadata, images = await gui.canvas_batch("fresh", points)
+            assert not images
+            assert metadata["status"] == "STOPPED" and metadata["acknowledged_clicks"] == 1
+            assert metadata["attempted_clicks"] == (1 if failure == "focus" else 2)
+            assert gui._call.await_count == metadata["attempted_clicks"]
+            assert not gui.observations
+            gui._observe.assert_not_awaited()
+        finally:
+            await gui.close()
+
+    asyncio.run(run())
+
+
+def test_crop_does_not_carry_to_a_new_dialog(gui):
+    batch_points(gui)
+    previous = gui.observations["fresh"]
+    target = {"hwnd": 20, "rect": [40, 50, 480, 550]}
+    backend_module.unique_target.return_value = target
+    gui._call.return_value = CallToolResult(content=[
+        ImageContent(type="image", mimeType="image/png", data=(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADElEQVQIHWP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
+        )),
+    ])
+
+    async def run():
+        metadata, _ = await WindowsMcpBackend._observe(gui, previous=previous)
+        assert metadata["frame_rect"] == target["rect"]
+        assert gui.observations[metadata["observation_id"]]["area"] is None
+        gui._call.assert_awaited_once_with("Screenshot", {"region": target["rect"]})
+
+    asyncio.run(run())
+
+
+def test_cancelling_batch_prevents_the_next_click(gui):
+    points = batch_points(gui)
+
+    async def run():
+        entered = asyncio.Event()
+        resume = asyncio.Event()
+
+        async def click(*_):
+            entered.set()
+            await resume.wait()
+
+        gui._call.side_effect = click
+        running = asyncio.create_task(gui.canvas_batch("fresh", points))
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=2)
+            running.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await running
+        finally:
+            resume.set()
+            await gui.close()
+        gui._call.assert_awaited_once()
+        gui._observe.assert_not_awaited()
 
     asyncio.run(run())

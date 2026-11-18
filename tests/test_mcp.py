@@ -20,7 +20,7 @@ def test_real_stdio_handshake_and_tool_calls():
             tools = await session.list_tools()
             assert {t.name for t in tools.tools} == {"proteus_doctor", "circuit_validate", "circuit_plan",
                 "circuit_run", "circuit_record", "windows_capabilities", "proteus_observe",
-                "proteus_action", "proteus_release"}
+                "proteus_action", "proteus_canvas_batch", "proteus_release"}
             spec = json.loads((root / "examples/led_dc.json").read_text(encoding="utf-8-sig"))
             for name in ("circuit_validate", "circuit_plan"):
                 result = await session.call_tool(name, {"spec": spec})
