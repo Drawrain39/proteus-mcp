@@ -1,5 +1,7 @@
 # proteus-mcp
 
+[English](README.en.md) · 简体中文
+
 使AI Agent/Harness 能够直接操控Proteus，提升AI对于proteus的工作效率
 
 基于proteus8的MCP服务，暂时先不做proteus9相关（其实是因为学校数电实验的proteus就是proteus8的）
