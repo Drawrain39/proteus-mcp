@@ -1,0 +1,31 @@
+{
+  "schema_version": "0.1-draft",
+  "name": "at89c51_8led",
+  "purpose": "Keil C51 与 Proteus 的 8 位流水灯需求草案",
+  "components_required": [
+    "AT89C51 (or locally available model after verification)",
+    "LED-RED x8",
+    "current-limiting resistors x8",
+    "appropriate supply and ground",
+    "crystal/clock per model",
+    "reset network if model requires"
+  ],
+  "logical_behavior": "八个 LED 依次点亮，每步 250 ms，循环运行",
+  "recommended_port": "P1.0..P1.7 (verify actual port, LED polarity, current drive and model pin names)",
+  "power_and_reset": "Must verify VCC/GND, EA high for internal program memory, oscillator 12 MHz or as chosen, reset behavior and program memory configuration. Never assume pin numbers without checking device library and datasheet.",
+  "firmware": {
+    "language": "Keil C51",
+    "compile_target": "AT89C51-compatible 8051",
+    "produce_hex": true,
+    "require_compilation_log": true
+  },
+  "simulation": {
+    "duration_seconds": 5,
+    "verification": "multiple timestamped screenshots or scope/probe traces demonstrating sequential LED changes"
+  },
+  "meta": {
+    "draft_only": true,
+    "requires_keil_c51": true,
+    "requires_real_library_verification": true
+  }
+}

@@ -1,0 +1,32 @@
+ISIS SCHEMATIC DESCRIPTION FORMAT 8.0
+=====================================
+Design:   led_dc_minimal.pdsprj
+Doc. no.: <NONE>
+Revision: <NONE>
+Author:   <NONE>
+Created:  2026/11/18
+Modified: 2026/11/18
+
+*PROPERTIES,0    
+
+*MODELDEFS,0    
+
+*PARTLIST,3    
+BT1,BATTERY,9V,EID=2
+D1,LED-RED,LED-RED,BV=4V,DRIVE=1,EID=1,IMAX=10mA,ROFF=100k,RS=3,TLITMIN=0.1ms,VF=2.2V
+R1,RES,1k,EID=3,PACKAGE=RES40,PRIMTYPE=RESISTOR
+
+*NETLIST,3    
+#00000,2
+D1,PS,A
+R1,PS,2
+
+#00002,2
+BT1,PS,+
+R1,PS,1
+
+GND,3,CLASS=POWER
+GND,PR
+D1,PS,K
+BT1,PS,-
+

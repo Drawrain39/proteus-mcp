@@ -1,0 +1,68 @@
+{
+  "schema_version": "0.1-draft",
+  "name": "led_dc_minimal",
+  "purpose": "Proteus 8.9 SP2 最小 LED 电路放置、连线与仿真验收",
+  "components": [
+    {
+      "ref": "BT1",
+      "device_query": "BATTERY",
+      "properties": {
+        "voltage": "9V"
+      }
+    },
+    {
+      "ref": "R1",
+      "device_query": "RES",
+      "properties": {
+        "resistance": "1k"
+      }
+    },
+    {
+      "ref": "D1",
+      "device_query": "LED-RED",
+      "properties": {}
+    },
+    {
+      "ref": "GND",
+      "device_query": "GROUND",
+      "properties": {}
+    }
+  ],
+  "nets": [
+    {
+      "name": "VPLUS",
+      "pins": [
+        "BT1.positive",
+        "R1.1"
+      ]
+    },
+    {
+      "name": "LED_A",
+      "pins": [
+        "R1.2",
+        "D1.A"
+      ]
+    },
+    {
+      "name": "GND",
+      "pins": [
+        "D1.K",
+        "BT1.negative",
+        "GND.terminal"
+      ]
+    }
+  ],
+  "pin_resolution_policy": "所有 pin 标识是逻辑别名，执行器需先核对当前 Proteus 器件库的真实引脚并记录对应关系",
+  "simulation": {
+    "type": "interactive",
+    "expected": "LED 亮且无模拟错误；以真实仿真状态或测量验证，单靠点击运行不够"
+  },
+  "output": {
+    "project_basename": "led_dc_minimal",
+    "must_be_real_proteus_project": true
+  },
+  "meta": {
+    "draft_only": true,
+    "requires_library_verification": true
+  }
+}

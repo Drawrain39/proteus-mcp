@@ -1,0 +1,8 @@
+{
+  "proteus_exe": "C:\\Program Files (x86)\\Labcenter Electronics\\Proteus 8 Professional\\BIN\\PDS.EXE",
+  "windows_python": ".venv-windows/Scripts/python.exe",
+  "keil_exe": null,
+  "gui_enabled": false,
+  "timeout_seconds": 45
+}
+
