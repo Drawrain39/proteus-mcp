@@ -13,6 +13,7 @@ class Settings(BaseModel):
     keil_exe: Path | None = None
     windows_python: Path | None = None
     gui_enabled: bool = False
+    canvas_click_settle_ms: int = Field(default=125, ge=100, le=500, strict=True)
     timeout_seconds: float = Field(default=45, ge=1, le=120)
 
     def within_workspace(self, value: str | Path) -> Path:

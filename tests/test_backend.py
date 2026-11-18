@@ -8,6 +8,7 @@ from mcp.types import CallToolResult, ImageContent
 from proteus_mcp import backend as backend_module
 from proteus_mcp.backend import CanvasPoint, ViewRegion, WindowsMcpBackend
 from proteus_mcp.config import Settings
+from proteus_mcp.windows_worker import CANVAS_CLICK
 
 
 @pytest.fixture
@@ -96,14 +97,21 @@ def batch_points(gui):
     return [CanvasPoint(x=0.25, y=0.5), CanvasPoint(x=0.75, y=0.5), CanvasPoint(x=0.5, y=0.5)]
 
 
-def test_canvas_batch_uses_crop_coordinates_and_takes_one_final_screenshot(gui):
+@pytest.mark.parametrize(("available", "standard_speed"), [(False, False), (True, False), (True, True)])
+def test_canvas_batch_uses_crop_coordinates_and_takes_one_final_screenshot(gui, available, standard_speed):
     points = batch_points(gui)
+    if available:
+        gui.tools[CANVAS_CLICK] = {}
+    fast = available and not standard_speed
 
     async def run():
         try:
-            metadata, _ = await gui.canvas_batch("fresh", points)
+            metadata, _ = await gui.canvas_batch("fresh", points, standard_speed=standard_speed)
             assert metadata["acknowledged_clicks"] == 3
+            assert metadata["click_tool"] == (CANVAS_CLICK if fast else "Click")
             assert [c.args[1]["loc"] for c in gui._call.await_args_list] == [[0, 300], [200, 300], [100, 300]]
+            if fast:
+                assert gui._call.await_args.args[1]["frame"] == [-100, 150, 300, 450]
             assert gui._observe.await_count == 1
             assert gui._observe.await_args.kwargs["same_target"]
             with pytest.raises(ValueError, match="consumed"):
@@ -120,8 +128,10 @@ def test_batch_stops_without_retry_when_partially_executed(gui, failure):
     if failure == "focus":
         backend_module.unique_target.side_effect = [
             backend_module.unique_target.return_value, {"hwnd": 20, "rect": [0, 0, 400, 400]}]
+        gui._observe.side_effect = ValueError("Target changed during diagnostic")
     else:
         gui._call.side_effect = [None, TimeoutError("Uncertain click")]
+        gui._observe.return_value = ({"screenshot": "diagnostic.png"}, [])
 
     async def run():
         try:
@@ -131,9 +141,25 @@ def test_batch_stops_without_retry_when_partially_executed(gui, failure):
             assert metadata["attempted_clicks"] == (1 if failure == "focus" else 2)
             assert gui._call.await_count == metadata["attempted_clicks"]
             assert not gui.observations
-            gui._observe.assert_not_awaited()
+            assert gui._observe.await_args.kwargs["issue_token"] is False
+            if failure == "focus":
+                assert "diagnostic_screenshot" not in metadata
+            else:
+                assert metadata["diagnostic_screenshot"] == "diagnostic.png"
         finally:
             await gui.close()
+
+    asyncio.run(run())
+
+
+def test_explicit_release_is_not_repeated_on_shutdown(gui):
+    gui.session = Mock()
+    gui._release_due = True
+
+    async def run():
+        await gui.release()
+        await gui.close()
+        gui._call.assert_awaited_once_with("ControlStatus", {"release": True})
 
     asyncio.run(run())
 

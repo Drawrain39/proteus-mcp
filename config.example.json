@@ -3,6 +3,7 @@
   "windows_python": ".venv-windows/Scripts/python.exe",
   "keil_exe": null,
   "gui_enabled": false,
+  "canvas_click_settle_ms": 125,
   "timeout_seconds": 45
 }
 

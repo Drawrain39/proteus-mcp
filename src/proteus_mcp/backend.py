@@ -23,10 +23,9 @@ from .evidence import EvidenceStore, sha256
 from .netlist import verify_netlist
 from .runner import prepare_run
 from .spec import read_spec
+from .windows_worker import CANVAS_CLICK, WINDOWS_STATUS, WINDOWS_TOOLS, is_schematic
 from .winread import assert_target_point, unique_target
 
-WINDOWS_TOOLS = ("Screenshot", "Click", "Type", "Shortcut")
-WINDOWS_STATUS = "ControlStatus"  # Always surfaced by Windows-MCP 0.8.9.
 SHORTCUTS = {"escape", "enter", "tab", "shift+tab", "ctrl+a", "ctrl+n", "ctrl+o", "ctrl+s",
              "ctrl+shift+s", "ctrl+z", "ctrl+y", "p", "r", "l", "m", "e", "space", "f8",
              "up", "down", "left", "right", "home", "end"}
@@ -79,6 +78,7 @@ class WindowsMcpBackend:
         self.stack: AsyncExitStack | None = None
         self.session: ClientSession | None = None
         self.tools: dict = {}
+        self._release_due = False
         self.queue: asyncio.Queue[tuple[Callable[[], Awaitable], asyncio.Future] | None] = asyncio.Queue()
         self.worker: asyncio.Task | None = None
         self.active_request: asyncio.Future | None = None
@@ -130,10 +130,19 @@ class WindowsMcpBackend:
         interpreter = self.settings.windows_python
         if not interpreter or not interpreter.is_file():
             raise ValueError("Set windows_python to the isolated Windows-MCP Python executable")
+        tools_expected = {*WINDOWS_TOOLS, WINDOWS_STATUS}
+        exe = discover_proteus(self.settings)
+        if exe is not None and self.settings.canvas_click_settle_ms < 500:
+            args = ["-B", str(Path(__file__).with_name("windows_worker.py")), str(exe),
+                    str(self.settings.canvas_click_settle_ms)]
+            tools_expected.add(CANVAS_CLICK)
+        else:
+            args = ["-B", "-m", "windows_mcp", "serve", "--transport", "stdio",
+                    "--tools", ",".join(WINDOWS_TOOLS)]
         stack = AsyncExitStack()
         try:
             streams = await stack.enter_async_context(stdio_client(StdioServerParameters(
-                command=str(interpreter), args=["-m", "windows_mcp", "serve", "--tools", ",".join(WINDOWS_TOOLS)],
+                command=str(interpreter), args=args,
                 env={"ANONYMIZED_TELEMETRY": "false", "PYTHONIOENCODING": "utf-8"},
                 cwd=str(self.settings.workspace))))
             session = await stack.enter_async_context(ClientSession(
@@ -141,7 +150,7 @@ class WindowsMcpBackend:
             await session.initialize()
             listing = await session.list_tools()
             tools = {tool.name: tool.model_dump(mode="json") for tool in listing.tools}
-            if set(tools) != {*WINDOWS_TOOLS, WINDOWS_STATUS}:
+            if set(tools) != tools_expected:
                 raise ValueError(f"Unexpected Windows-MCP tool set: {sorted(tools)}")
         except BaseException:
             await stack.aclose()
@@ -156,8 +165,10 @@ class WindowsMcpBackend:
 
     async def _release(self):
         self.observations.clear()
-        if self.session:
-            return await self._call(WINDOWS_STATUS, {"release": True})
+        if self.session and self._release_due:
+            result = await self._call(WINDOWS_STATUS, {"release": True})
+            self._release_due = False
+            return result
         return None
 
     async def release(self) -> dict:
@@ -231,12 +242,15 @@ class WindowsMcpBackend:
         async def read():
             await self._connect()
             return {"status": "PASS", "transport": "stdio", "tools": list(self.tools.values()),
+                    "canvas_click_settle_ms": self.settings.canvas_click_settle_ms if CANVAS_CLICK in self.tools else 500,
                     "note": "Handshake only; no GUI or simulation result is implied."}
         return await self._request(read)
 
     async def _call(self, name: str, args: dict):
         if not self.session:
             raise ValueError("Backend not connected")
+        if name != WINDOWS_STATUS:
+            self._release_due = True
         result = await self.session.call_tool(name, args)
         messages = [item.text for item in result.content if item.type == "text"]
         blocked_click = name == "Click" and any("so the click went nowhere" in text for text in messages)
@@ -259,7 +273,7 @@ class WindowsMcpBackend:
 
     async def _observe(
         self, area: ViewRegion | None = None, *, previous: dict | None = None,
-        same_target: bool = False, input_ms: float | None = None,
+        same_target: bool = False, input_ms: float | None = None, issue_token: bool = True,
     ):
         self.observations.clear()
         exe = self._proteus_exe()
@@ -285,15 +299,19 @@ class WindowsMcpBackend:
             stream.write(image_bytes)
         if self.project_destination:
             self.run_screenshots.add(shot.name)
-        token = uuid4().hex
-        self.observations[token] = {"target": target, "time": time.monotonic(), "frame": frame, "area": area}
         timing = {"capture_ms": capture_ms}
         if input_ms is not None:
             timing["input_ms"] = input_ms
-        metadata = {"status": "PASS", "observation_id": token, "expires_seconds": 30,
-                    "target": target, "screenshot": str(shot),
+        metadata = {"status": "PASS", "target": target, "screenshot": str(shot),
                     "frame_rect": frame, "image_bytes": len(image_bytes), "timing": timing,
-                    "note": "Coordinates are relative to this image. The observation token is single-use."}
+                    "note": "Diagnostic image only; observe again before input."}
+        if issue_token:
+            token = uuid4().hex
+            self.observations[token] = {
+                "target": target, "time": time.monotonic(), "frame": frame, "area": area,
+            }
+            metadata.update(observation_id=token, expires_seconds=30,
+                            note="Coordinates are relative to this image. The observation token is single-use.")
         store.event("observe", **metadata)
         return metadata, images
 
@@ -322,32 +340,35 @@ class WindowsMcpBackend:
         if loc is not None:
             assert_target_point(target, *loc, allow_menu=allow_menu)
 
-    async def canvas_batch(self, observation_id: str, points: list[CanvasPoint]):
+    async def canvas_batch(self, observation_id: str, points: list[CanvasPoint], *, standard_speed: bool = False):
         async def send():
             if not 2 <= len(points) <= MAX_BATCH_CLICKS:
                 raise ValueError(f"Provide 2 to {MAX_BATCH_CLICKS} canvas points")
             exe, snapshot = self._take_observation(observation_id)
             if snapshot.get("area") is None or snapshot["frame"] == snapshot["target"]["rect"]:
                 raise ValueError("Observe the cropped schematic canvas before batching")
-            title = snapshot["target"]["title"].casefold()
-            if not title.endswith(("schematic capture", "原理图绘制")):
+            if not is_schematic(snapshot["target"]["title"]):
                 raise ValueError("Batch clicks require the Proteus schematic canvas")
             locs = [point_pixels(snapshot["frame"], point.x, point.y) for point in points]
             store = self._store()
             attempted = completed = 0
             input_seconds = 0.0
             batch_id = uuid4().hex
+            fast = not standard_speed and CANVAS_CLICK in self.tools
+            tool = CANVAS_CLICK if fast else "Click"
+            settle_ms = self.settings.canvas_click_settle_ms if fast else 500
             try:
                 for loc in locs:
                     if self.active_request is not None and self.active_request.cancelled():
                         raise ValueError("Batch request cancelled")
                     self._check_target(exe, snapshot, loc, allow_menu=False)
-                    args = {"loc": loc, "button": "left", "clicks": 1}
-                    store.event("input_attempt", observation_id=observation_id, tool="Click", arguments=args,
-                                batch_id=batch_id, step=attempted + 1)
+                    args = ({"loc": loc, "target": snapshot["target"], "frame": snapshot["frame"]} if fast
+                            else {"loc": loc, "button": "left", "clicks": 1})
+                    store.event("input_attempt", observation_id=observation_id, tool=tool, arguments=args,
+                                batch_id=batch_id, step=attempted + 1, settle_ms=settle_ms)
                     attempted += 1
                     started = time.perf_counter()
-                    await self._call("Click", args)
+                    await self._call(tool, args)
                     input_seconds += time.perf_counter() - started
                     completed += 1
                 metadata, images = await self._observe(previous=snapshot, same_target=True, input_ms=ms(input_seconds))
@@ -357,9 +378,19 @@ class WindowsMcpBackend:
                           "attempted_clicks": attempted, "acknowledged_clicks": completed,
                           "reason": str(exc),
                           "note": "Observe again and verify the canvas before continuing. Do not replay blindly."}
+                images = []
+                if attempted and not (self.active_request and self.active_request.cancelled()):
+                    try:
+                        async with asyncio.timeout(1.5):
+                            diagnostic, images = await self._observe(previous=snapshot, same_target=True,
+                                                                      issue_token=False)
+                        result["diagnostic_screenshot"] = diagnostic["screenshot"]
+                    except (ExceptionGroup, McpError, OSError, ValueError, TimeoutError) as capture_error:
+                        result["diagnostic_error"] = str(capture_error)
                 store.event("batch_stopped", **result)
-                return result, []
-            batch = {"batch_id": batch_id, "attempted_clicks": attempted, "acknowledged_clicks": completed}
+                return result, images
+            batch = {"batch_id": batch_id, "attempted_clicks": attempted, "acknowledged_clicks": completed,
+                     "click_tool": tool, "click_settle_ms": settle_ms}
             store.event("batch_completed", **batch, timing=metadata.get("timing", {}))
             return {**metadata, **batch}, images
         return await self._request(send)

@@ -9,6 +9,7 @@ import platform
 import shutil
 from pathlib import Path
 
+from . import API_REVISION
 from .config import Settings
 from .evidence import utc_now
 
@@ -77,6 +78,8 @@ def doctor(settings: Settings) -> dict:
     return {"timestamp": utc_now(), "status": "PASS" if os.name == "nt" and exe else "BLOCKED",
             "os": platform.platform(), "local_windows": os.name == "nt", "python": platform.python_version(),
             "workspace": str(settings.workspace), "commands": commands, "packages": versions,
+            "api_revision": API_REVISION,
+            "features": ["cropped_observation", "canvas_batch", "fast_canvas_input", "batch_diagnostic_frame"],
             "proteus": {"path": str(exe) if exe else None, "version": file_version(exe) if exe else None,
                         "windows": windows, "diagnostic_error": desktop_error},
             "keil": {"path": str(settings.keil_exe) if settings.keil_exe else commands["UV4"],
@@ -84,6 +87,7 @@ def doctor(settings: Settings) -> dict:
             "codex": {"config_exists": config.is_file(), "mcp_server_names": mcp_names},
             "windows_backend": {"python": str(settings.windows_python) if settings.windows_python else None,
                                 "installed": bool(settings.windows_python and settings.windows_python.is_file()),
+                                "canvas_click_settle_ms": settings.canvas_click_settle_ms,
                                 "gui_enabled": settings.gui_enabled},
             "notes": ["Executable detection is not license, desktop, drawing or simulation acceptance."]}
 
