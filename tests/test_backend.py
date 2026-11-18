@@ -1,5 +1,7 @@
 import asyncio
+import json
 import time
+from multiprocessing.shared_memory import SharedMemory
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -8,7 +10,7 @@ from mcp.types import CallToolResult, ImageContent
 from proteus_mcp import backend as backend_module
 from proteus_mcp.backend import CanvasPoint, ViewRegion, WindowsMcpBackend
 from proteus_mcp.config import Settings
-from proteus_mcp.windows_worker import CANVAS_CLICK
+from proteus_mcp.windows_worker import ACKNOWLEDGED, ATTEMPTED, CANCELLED, CANVAS_BATCH
 
 
 @pytest.fixture
@@ -101,17 +103,33 @@ def batch_points(gui):
 def test_canvas_batch_uses_crop_coordinates_and_takes_one_final_screenshot(gui, available, standard_speed):
     points = batch_points(gui)
     if available:
-        gui.tools[CANVAS_CLICK] = {}
+        gui.tools[CANVAS_BATCH] = {}
     fast = available and not standard_speed
+
+    async def batch(_, args):
+        state = SharedMemory(name=args["state_name"])
+        try:
+            state.buf[ATTEMPTED] = state.buf[ACKNOWLEDGED] = len(args["locs"])
+        finally:
+            state.close()
+        return CallToolResult(content=[], structuredContent={"status": "PASS"})
+
+    if fast:
+        gui._call.side_effect = batch
 
     async def run():
         try:
             metadata, _ = await gui.canvas_batch("fresh", points, standard_speed=standard_speed)
             assert metadata["acknowledged_clicks"] == 3
-            assert metadata["click_tool"] == (CANVAS_CLICK if fast else "Click")
-            assert [c.args[1]["loc"] for c in gui._call.await_args_list] == [[0, 300], [200, 300], [100, 300]]
+            assert metadata["click_tool"] == (CANVAS_BATCH if fast else "Click")
+            locs = [[0, 300], [200, 300], [100, 300]]
             if fast:
+                gui._call.assert_awaited_once()
+                assert gui._call.await_args.args[1]["locs"] == locs
                 assert gui._call.await_args.args[1]["frame"] == [-100, 150, 300, 450]
+            else:
+                assert [c.args[1]["loc"] for c in gui._call.await_args_list] == locs
+            assert metadata["input_calls"] == gui._call.await_count
             assert gui._observe.await_count == 1
             assert gui._observe.await_args.kwargs["same_target"]
             with pytest.raises(ValueError, match="consumed"):
@@ -122,16 +140,32 @@ def test_canvas_batch_uses_crop_coordinates_and_takes_one_final_screenshot(gui, 
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("failure", ["focus", "input"])
+@pytest.mark.parametrize("failure", ["focus", "input", "worker", "worker_timeout"])
 def test_batch_stops_without_retry_when_partially_executed(gui, failure):
     points = batch_points(gui)
     if failure == "focus":
         backend_module.unique_target.side_effect = [
             backend_module.unique_target.return_value, {"hwnd": 20, "rect": [0, 0, 400, 400]}]
         gui._observe.side_effect = ValueError("Target changed during diagnostic")
-    else:
+    elif failure == "input":
         gui._call.side_effect = [None, TimeoutError("Uncertain click")]
         gui._observe.return_value = ({"screenshot": "diagnostic.png"}, [])
+    else:
+        gui.tools[CANVAS_BATCH] = {}
+        gui._observe.return_value = ({"screenshot": "diagnostic.png"}, [])
+
+        async def batch(_, args):
+            state = SharedMemory(name=args["state_name"])
+            try:
+                state.buf[ATTEMPTED] = 2
+                state.buf[ACKNOWLEDGED] = 1
+                if failure == "worker_timeout":
+                    raise TimeoutError("No worker reply")
+                return CallToolResult(content=[], structuredContent={"status": "STOPPED", "reason": "Preempted"})
+            finally:
+                state.close()
+
+        gui._call.side_effect = batch
 
     async def run():
         try:
@@ -139,7 +173,8 @@ def test_batch_stops_without_retry_when_partially_executed(gui, failure):
             assert not images
             assert metadata["status"] == "STOPPED" and metadata["acknowledged_clicks"] == 1
             assert metadata["attempted_clicks"] == (1 if failure == "focus" else 2)
-            assert gui._call.await_count == metadata["attempted_clicks"]
+            assert metadata["stopped_at_point"] == 2
+            assert gui._call.await_count == (2 if failure == "input" else 1)
             assert not gui.observations
             assert gui._observe.await_args.kwargs["issue_token"] is False
             if failure == "focus":
@@ -205,6 +240,45 @@ def test_cancelling_batch_prevents_the_next_click(gui):
         finally:
             resume.set()
             await gui.close()
+        gui._call.assert_awaited_once()
+        gui._observe.assert_not_awaited()
+
+    asyncio.run(run())
+
+
+def test_cancelling_batch_signals_the_worker_and_records_progress(gui):
+    points = batch_points(gui)
+    gui.tools[CANVAS_BATCH] = {}
+
+    async def run():
+        entered = asyncio.Event()
+
+        async def batch(_, args):
+            state = SharedMemory(name=args["state_name"])
+            try:
+                state.buf[ATTEMPTED] = state.buf[ACKNOWLEDGED] = 1
+                entered.set()
+                while not state.buf[CANCELLED]:
+                    await asyncio.sleep(0.001)
+                return CallToolResult(content=[], structuredContent={
+                    "status": "STOPPED", "reason": "Batch request cancelled",
+                })
+            finally:
+                state.close()
+
+        gui._call.side_effect = batch
+        running = asyncio.create_task(gui.canvas_batch("fresh", points))
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=2)
+            running.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await running
+        finally:
+            await asyncio.wait_for(gui.close(), timeout=2)
+        events = (gui.store.path / "events.jsonl").read_text(encoding="utf-8").splitlines()
+        stopped = json.loads(events[-1])
+        assert stopped["op"] == "batch_stopped"
+        assert (stopped["attempted_clicks"], stopped["acknowledged_clicks"], stopped["stopped_at_point"]) == (1, 1, 2)
         gui._call.assert_awaited_once()
         gui._observe.assert_not_awaited()
 

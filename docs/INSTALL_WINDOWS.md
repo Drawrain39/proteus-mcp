@@ -33,6 +33,6 @@ codex mcp list
 
 在新的 Codex 会话加载注册项。MCP 输入默认关闭。通过只读截图检查后，在 `config.local.json` 设置 `"gui_enabled": true`，并重新启动该 MCP 服务。Windows-MCP 自带桌面控制许可与接管机制，桌面显示许可对话框时请在本机处理。
 
-用 `proteus_doctor` 确认当前会话是否加载了 `api_revision: 3`。快点击默认在画布批次的每次松键后等待 125 ms。若某个环境对快点击的响应不稳定，可在 `config.local.json` 中设置 `"canvas_click_settle_ms": 500` 并重启服务，恢复原来的点击路径。`windows-probe` 显示后端实际使用的等待设置。
+用 `proteus_doctor` 确认当前会话是否加载了 `api_revision: 4`。快点击默认在画布批次的每次松键后等待 125 ms。若某个环境对快点击的响应不稳定，可在 `config.local.json` 中设置 `"canvas_click_settle_ms": 500` 并重启服务，恢复原来的点击路径。`windows-probe` 显示后端实际使用的等待设置。
 
 如要撤销注册，使用 `codex mcp remove proteus` 和 `codex mcp remove windows_gui`。若撤销前确认配置没有其他修改，也可以从注册脚本打印的备份恢复。

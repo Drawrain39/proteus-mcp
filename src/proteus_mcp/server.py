@@ -94,7 +94,8 @@ def make_server(settings: Settings) -> FastMCP:
         that crop, in order, for known wire endpoints/bends, placements or simulation switches.
         Do not batch actions that can move the canvas or open a dialog. Inspect the result before continuing.
         Use standard_speed for a batch that needs the original 500 ms wait.
-        STOPPED gives partial counts and requires a new observation; do not replay the entire batch.
+        STOPPED gives partial counts and the first unconfirmed point, if any. Observe again before
+        continuing. A client-side MCP cancellation keeps the partial counts in the local log.
         """
         metadata, content = await windows.canvas_batch(observation_id, points, standard_speed=standard_speed)
         return [TextContent(type="text", text=json.dumps(metadata, ensure_ascii=False)), *content]

@@ -7,8 +7,9 @@ import base64
 import os
 import time
 from collections.abc import Awaitable, Callable
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, contextmanager
 from datetime import timedelta
+from multiprocessing.shared_memory import SharedMemory
 from pathlib import Path
 from uuid import uuid4
 
@@ -23,13 +24,22 @@ from .evidence import EvidenceStore, sha256
 from .netlist import verify_netlist
 from .runner import prepare_run
 from .spec import read_spec
-from .windows_worker import CANVAS_CLICK, WINDOWS_STATUS, WINDOWS_TOOLS, is_schematic
+from .windows_worker import (
+    ACKNOWLEDGED,
+    ATTEMPTED,
+    BATCH_STATE_SIZE,
+    CANCELLED,
+    CANVAS_BATCH,
+    MAX_BATCH_CLICKS,
+    WINDOWS_STATUS,
+    WINDOWS_TOOLS,
+    is_schematic,
+)
 from .winread import assert_target_point, unique_target
 
 SHORTCUTS = {"escape", "enter", "tab", "shift+tab", "ctrl+a", "ctrl+n", "ctrl+o", "ctrl+s",
              "ctrl+shift+s", "ctrl+z", "ctrl+y", "p", "r", "l", "m", "e", "space", "f8",
              "up", "down", "left", "right", "home", "end"}
-MAX_BATCH_CLICKS = 16
 
 
 class CanvasPoint(BaseModel):
@@ -135,7 +145,7 @@ class WindowsMcpBackend:
         if exe is not None and self.settings.canvas_click_settle_ms < 500:
             args = ["-B", str(Path(__file__).with_name("windows_worker.py")), str(exe),
                     str(self.settings.canvas_click_settle_ms)]
-            tools_expected.add(CANVAS_CLICK)
+            tools_expected.add(CANVAS_BATCH)
         else:
             args = ["-B", "-m", "windows_mcp", "serve", "--transport", "stdio",
                     "--tools", ",".join(WINDOWS_TOOLS)]
@@ -242,7 +252,7 @@ class WindowsMcpBackend:
         async def read():
             await self._connect()
             return {"status": "PASS", "transport": "stdio", "tools": list(self.tools.values()),
-                    "canvas_click_settle_ms": self.settings.canvas_click_settle_ms if CANVAS_CLICK in self.tools else 500,
+                    "canvas_click_settle_ms": self.settings.canvas_click_settle_ms if CANVAS_BATCH in self.tools else 500,
                     "note": "Handshake only; no GUI or simulation result is implied."}
         return await self._request(read)
 
@@ -340,6 +350,27 @@ class WindowsMcpBackend:
         if loc is not None:
             assert_target_point(target, *loc, allow_menu=allow_menu)
 
+    @contextmanager
+    def _canvas_batch_state(self):
+        state = SharedMemory(create=True, size=BATCH_STATE_SIZE)
+        request = self.active_request
+
+        def signal_cancel(done: asyncio.Future) -> None:
+            if done.cancelled() and state.buf is not None:
+                state.buf[CANCELLED] = 1
+
+        try:
+            if request is not None:
+                request.add_done_callback(signal_cancel)
+                signal_cancel(request)
+            yield state
+        finally:
+            state.buf[CANCELLED] = 1
+            if request is not None:
+                request.remove_done_callback(signal_cancel)
+            state.close()
+            state.unlink()
+
     async def canvas_batch(self, observation_id: str, points: list[CanvasPoint], *, standard_speed: bool = False):
         async def send():
             if not 2 <= len(points) <= MAX_BATCH_CLICKS:
@@ -351,33 +382,62 @@ class WindowsMcpBackend:
                 raise ValueError("Batch clicks require the Proteus schematic canvas")
             locs = [point_pixels(snapshot["frame"], point.x, point.y) for point in points]
             store = self._store()
-            attempted = completed = 0
+            attempted = completed = input_calls = 0
             input_seconds = 0.0
             batch_id = uuid4().hex
-            fast = not standard_speed and CANVAS_CLICK in self.tools
-            tool = CANVAS_CLICK if fast else "Click"
+            fast = not standard_speed and CANVAS_BATCH in self.tools
+            tool = CANVAS_BATCH if fast else "Click"
             settle_ms = self.settings.canvas_click_settle_ms if fast else 500
+            batch = {"batch_id": batch_id, "click_tool": tool, "click_settle_ms": settle_ms}
             try:
-                for loc in locs:
-                    if self.active_request is not None and self.active_request.cancelled():
-                        raise ValueError("Batch request cancelled")
-                    self._check_target(exe, snapshot, loc, allow_menu=False)
-                    args = ({"loc": loc, "target": snapshot["target"], "frame": snapshot["frame"]} if fast
-                            else {"loc": loc, "button": "left", "clicks": 1})
-                    store.event("input_attempt", observation_id=observation_id, tool=tool, arguments=args,
-                                batch_id=batch_id, step=attempted + 1, settle_ms=settle_ms)
-                    attempted += 1
-                    started = time.perf_counter()
-                    await self._call(tool, args)
-                    input_seconds += time.perf_counter() - started
-                    completed += 1
+                if fast:
+                    with self._canvas_batch_state() as state:
+                        if state.buf[CANCELLED]:
+                            raise ValueError("Batch request cancelled")
+                        args = {"locs": locs, "target": snapshot["target"], "frame": snapshot["frame"]}
+                        store.event("input_attempt", **batch, observation_id=observation_id,
+                                    tool=tool, arguments=args)
+                        started = time.perf_counter()
+                        input_calls = 1
+                        try:
+                            response = await self._call(tool, {
+                                **args, "state_name": state.name,
+                                "deadline": time.monotonic() + self.settings.timeout_seconds,
+                            })
+                        finally:
+                            state.buf[CANCELLED] = 1
+                            attempted, completed = state.buf[ATTEMPTED], state.buf[ACKNOWLEDGED]
+                            input_seconds = time.perf_counter() - started
+                    payload = response.structuredContent or {}
+                    if payload.get("status") == "STOPPED":
+                        raise ValueError(payload.get("reason") or "Windows-MCP stopped the canvas batch")
+                    if payload.get("status") != "PASS" or completed != len(locs):
+                        raise ValueError("Windows-MCP did not confirm the full canvas batch")
+                else:
+                    for loc in locs:
+                        if self.active_request is not None and self.active_request.cancelled():
+                            raise ValueError("Batch request cancelled")
+                        self._check_target(exe, snapshot, loc, allow_menu=False)
+                        args = {"loc": loc, "button": "left", "clicks": 1}
+                        store.event("input_attempt", observation_id=observation_id, tool=tool, arguments=args,
+                                    batch_id=batch_id, step=attempted + 1, settle_ms=settle_ms)
+                        attempted += 1
+                        input_calls += 1
+                        started = time.perf_counter()
+                        await self._call(tool, args)
+                        input_seconds += time.perf_counter() - started
+                        completed += 1
+                if self.active_request is not None and self.active_request.cancelled():
+                    raise ValueError("Batch request cancelled")
                 metadata, images = await self._observe(previous=snapshot, same_target=True, input_ms=ms(input_seconds))
             except (ExceptionGroup, McpError, OSError, ValueError, TimeoutError) as exc:
                 self.observations.clear()
-                result = {"status": "STOPPED", "batch_id": batch_id,
+                result = {**batch, "status": "STOPPED", "input_calls": input_calls,
                           "attempted_clicks": attempted, "acknowledged_clicks": completed,
                           "reason": str(exc),
                           "note": "Observe again and verify the canvas before continuing. Do not replay blindly."}
+                if completed < len(locs):
+                    result["stopped_at_point"] = completed + 1
                 images = []
                 if attempted and not (self.active_request and self.active_request.cancelled()):
                     try:
@@ -389,8 +449,7 @@ class WindowsMcpBackend:
                         result["diagnostic_error"] = str(capture_error)
                 store.event("batch_stopped", **result)
                 return result, images
-            batch = {"batch_id": batch_id, "attempted_clicks": attempted, "acknowledged_clicks": completed,
-                     "click_tool": tool, "click_settle_ms": settle_ms}
+            batch.update(attempted_clicks=attempted, acknowledged_clicks=completed, input_calls=input_calls)
             store.event("batch_completed", **batch, timing=metadata.get("timing", {}))
             return {**metadata, **batch}, images
         return await self._request(send)
